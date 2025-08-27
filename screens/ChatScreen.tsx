@@ -1,0 +1,1356 @@
+import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
+import {
+  View,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  StyleSheet,
+  ScrollView,
+  Image,
+  useWindowDimensions,
+  ActivityIndicator,
+  PermissionsAndroid,
+  Platform,
+  Alert,
+  Vibration,
+  FlatList,
+  RefreshControl,
+  KeyboardAvoidingView,
+  Modal,
+} from 'react-native';
+import { FontAwesomeIcon } from '@fortawesome/react-native-fontawesome';
+import {
+  faMicrophone,
+  faArrowUp,
+  faMagnifyingGlass,
+  faChevronDown,
+  faPlus,
+  faFileLines,
+  faClipboardQuestion,
+  faClone,
+  faStop,
+  faCopy,
+  faCheck,
+  faTextWidth,
+  faTimes,
+} from '@fortawesome/free-solid-svg-icons';
+import { IconProp } from '@fortawesome/fontawesome-svg-core';
+import Markdown from 'react-native-markdown-display';
+import Toast from 'react-native-toast-message';
+import Clipboard from '@react-native-clipboard/clipboard';
+import AudioRecorderPlayer, {
+  AudioEncoderAndroidType,
+  AudioSourceAndroidType,
+  AVEncoderAudioQualityIOSType,
+  AVEncodingOption,
+} from 'react-native-audio-recorder-player';
+import RNFS from 'react-native-fs';
+
+interface UserProfile {
+  _id: string;
+  name: string;
+  email: string;
+  contact: string;
+  grade: string;
+  entity_info: {
+    _id: string;
+    name: string;
+  };
+}
+
+interface ChatScreenProps {
+  theme: {
+    background: string;
+    text: string;
+    secondarytext: string;
+    primary: string;
+    card: string;
+    secondary: string;
+    secondaryaction: string;
+  };
+  isSidebarOpen: boolean;
+  setIsSidebarOpen: (isOpen: boolean) => void;
+  setCurrentScreen: (screen: 'splash' | 'login' | 'chat' | 'settings') => void;
+  accessToken: string | null;
+  userProfile: UserProfile | null;
+}
+
+interface ChatHistoryItem {
+  _id: string;
+  title: string;
+}
+
+interface ApiMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  created_at: string;
+}
+
+interface Message {
+  id: string;
+  text: string;
+  sender: 'user' | 'ai';
+}
+
+interface ContextMenuProps {
+  isVisible: boolean;
+  position: { x: number; y: number };
+  onCopy: () => void;
+  onSelectText: () => void;
+  onClose: () => void;
+  theme: any;
+}
+
+interface SelectTextModalProps {
+  isVisible: boolean;
+  text: string;
+  onClose: () => void;
+  theme: any;
+}
+
+const ContextMenu: React.FC<ContextMenuProps> = ({ isVisible, position, onCopy, onSelectText, onClose, theme }) => {
+  if (!isVisible) return null;
+  return (
+    <View style={[styles.contextMenu, { top: position.y, left: position.x, backgroundColor: theme.secondaryaction }]}>
+      <TouchableOpacity onPress={onCopy} style={styles.contextMenuItem}>
+        <FontAwesomeIcon icon={faCopy as IconProp} size={16} color={theme.text} style={styles.contextMenuIcon} />
+        <Text style={[styles.contextMenuText, { color: theme.text }]}>Copy</Text>
+      </TouchableOpacity>
+      <TouchableOpacity onPress={onSelectText} style={styles.contextMenuItem}>
+        <FontAwesomeIcon icon={faTextWidth as IconProp} size={16} color={theme.text} style={styles.contextMenuIcon} />
+        <Text style={[styles.contextMenuText, { color: theme.text }]}>Select text</Text>
+      </TouchableOpacity>
+    </View>
+  );
+};
+
+const SelectTextModal: React.FC<SelectTextModalProps> = ({ isVisible, text, onClose, theme }) => {
+  return (
+    <Modal
+      animationType="fade"
+      transparent={true}
+      visible={isVisible}
+      onRequestClose={onClose}
+    >
+      <View style={styles.modalContainer}>
+        <View style={[styles.modalContent, { backgroundColor: theme.card }]}>
+          <TouchableOpacity onPress={onClose} style={styles.modalCloseButton}>
+            <FontAwesomeIcon icon={faTimes as IconProp} size={22} color={theme.secondarytext} />
+          </TouchableOpacity>
+          <Text style={[styles.modalTitle, { color: theme.text }]}>Select Text</Text>
+          <ScrollView style={styles.textSelectionScrollView}>
+            <Text selectable={true} style={[styles.selectableText, { color: theme.text }]}>
+              {text}
+            </Text>
+          </ScrollView>
+        </View>
+      </View>
+    </Modal>
+  );
+};
+
+const ChatScreen: React.FC<ChatScreenProps> = ({
+  theme,
+  isSidebarOpen,
+  setIsSidebarOpen,
+  setCurrentScreen,
+  accessToken,
+  userProfile,
+}) => {
+  const [newMessage, setNewMessage] = useState<string>('');
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [fetchedChatHistory, setFetchedChatHistory] = useState<ChatHistoryItem[]>([]);
+  const [isLoadingHistory, setIsLoadingHistory] = useState<boolean>(true);
+  const [errorFetchingHistory, setErrorFetchingHistory] = useState<string | null>(null);
+
+  const [selectedChatId, setSelectedChatId] = useState<string | null>(null);
+  const [isLoadingMessages, setIsLoadingMessages] = useState<boolean>(false);
+  const [errorFetchingMessages, setErrorFetchingMessages] = useState<string | null>(null);
+
+  const [isSendingMessage, setIsSendingMessage] = useState<boolean>(false);
+  const [isListening, setIsListening] = useState<boolean>(false);
+  const [hasMicPermission, setHasMicPermission] = useState<boolean>(false);
+  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
+  const [isMenuVisible, setIsMenuVisible] = useState<boolean>(false);
+  const [menuPosition, setMenuPosition] = useState({ x: 0, y: 0 });
+  const [selectedMessageText, setSelectedMessageText] = useState<string>('');
+  const [isDeepResearchActive, setIsDeepResearchActive] = useState<boolean>(false);
+  const [isRecordingLoading, setIsRecordingLoading] = useState<boolean>(false);
+  
+  const [isSelectTextModalVisible, setIsSelectTextModalVisible] = useState(false);
+  
+  const [isTranscribing, setIsTranscribing] = useState<boolean>(false);
+  const [recordedFilePath, setRecordedFilePath] = useState<string | null>(null);
+
+  const audioRecorderPlayer = useRef(  AudioRecorderPlayer);
+
+  const scrollViewRef = useRef<ScrollView>(null);
+  const { width, height } = useWindowDimensions();
+
+  const handleDeepResearchToggle = () => {
+    setIsDeepResearchActive(prevState => !prevState);
+  };
+
+  useEffect(() => {
+    if (scrollViewRef.current) {
+      scrollViewRef.current.scrollToEnd({ animated: true });
+    }
+  }, [messages, isSendingMessage, isTranscribing]);
+
+  useEffect(() => {
+    return () => {
+      audioRecorderPlayer.current.stopRecorder();
+      audioRecorderPlayer.current.stopPlayer();
+      audioRecorderPlayer.current.removePlayBackListener();
+      audioRecorderPlayer.current.removeRecordBackListener();
+    };
+  }, []);
+
+  const fetchChatHistory = useCallback(async () => {
+    if (!accessToken || !userProfile?._id) {
+      setIsLoadingHistory(false);
+      setErrorFetchingHistory('User not authenticated or profile ID is missing.');
+      return;
+    }
+
+    setIsLoadingHistory(true);
+    setErrorFetchingHistory(null);
+
+    try {
+      const apiUrl = `https://shiksha-gpt.com/api/conversations/${userProfile._id}`;
+      const response = await fetch(apiUrl, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${accessToken}`,
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error(`Failed to fetch chat history: ${response.status}`);
+      }
+
+      const data = await response.json();
+      setFetchedChatHistory(data);
+    } catch (error: any) {
+      console.error('Error fetching chat history:', error);
+      setErrorFetchingHistory(error.message || 'An unknown error occurred.');
+    } finally {
+      setIsLoadingHistory(false);
+    }
+  }, [accessToken, userProfile?._id]);
+
+  const fetchChatMessages = useCallback(async (chatId: string) => {
+    if (!accessToken) {
+      setErrorFetchingMessages('Access token is missing.');
+      return;
+    }
+
+    setIsLoadingMessages(true);
+    setErrorFetchingMessages(null);
+
+    try {
+      const apiUrl = `https://shiksha-gpt.com/api/conversation/${chatId}`;
+      const response = await fetch(apiUrl, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${accessToken}`,
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error(`Failed to fetch messages: ${response.status}`);
+      }
+
+      const data = await response.json();
+      const apiMessages: ApiMessage[] = data.messages;
+
+      const formattedMessages: Message[] = apiMessages.map((msg, index) => ({
+        id: `${chatId}-${index}`,
+        text: msg.content,
+        sender: msg.role === 'user' ? 'user' : 'ai',
+      }));
+
+      setMessages(formattedMessages);
+    } catch (error: any) {
+      console.error('Error fetching chat messages:', error);
+      setErrorFetchingMessages(error.message || 'An unknown error occurred while fetching messages.');
+    } finally {
+      setIsLoadingMessages(false);
+    }
+  }, [accessToken]);
+
+  useEffect(() => {
+    fetchChatHistory();
+  }, [fetchChatHistory]);
+
+  const getUserInitials = (name: string | undefined): string => {
+    if (!name) {
+      return 'GU';
+    }
+    const nameParts = name.trim().split(' ');
+    if (nameParts.length > 1) {
+      return (nameParts[0].charAt(0) + nameParts[nameParts.length - 1].charAt(0)).toUpperCase();
+    } else if (nameParts.length === 1) {
+      return nameParts[0].charAt(0).toUpperCase();
+    }
+    return 'GU';
+  };
+
+  const displayName = userProfile ? userProfile.name : 'Guest User';
+  const displayInitials = getUserInitials(userProfile?.name);
+
+  const filteredChatHistory = useMemo(() => {
+    if (!searchQuery) {
+      return fetchedChatHistory;
+    }
+    const lowerCaseQuery = searchQuery.toLowerCase();
+    return fetchedChatHistory.filter(item => item.title.toLowerCase().includes(lowerCaseQuery));
+  }, [fetchedChatHistory, searchQuery]);
+
+  const selectedChatTitle = useMemo(() => {
+    if (selectedChatId) {
+      const selectedChat = fetchedChatHistory.find(chat => chat._id === selectedChatId);
+      return selectedChat ? selectedChat.title : 'New chat';
+    }
+    return 'New chat';
+  }, [selectedChatId, fetchedChatHistory]);
+
+  const handleSendMessage = async () => {
+    const prompt = newMessage.trim();
+    if (!prompt || isSendingMessage || isTranscribing || !userProfile?._id) {
+      return;
+    }
+
+    setIsSendingMessage(true);
+    setNewMessage('');
+    const userMessageId = Date.now().toString();
+    setMessages(prevMessages => [...prevMessages, { id: userMessageId, text: prompt, sender: 'user' }]);
+
+    try {
+      const apiUrl = 'https://shiksha-gpt.com/api/message';
+      const payload: any = {
+        user_id: userProfile._id,
+        prompt: prompt,
+      };
+
+      if (selectedChatId) {
+        payload.conversation_id = selectedChatId;
+      }
+
+      const response = await fetch(apiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Failed to send message: ${response.status}`);
+      }
+
+      const data = await response.json();
+      const aiResponse = data.messages.find((msg: ApiMessage) => msg.role === 'assistant' && msg.content !== '');
+      if (aiResponse) {
+        setMessages(prevMessages => [
+          ...prevMessages,
+          { id: aiResponse.created_at, text: aiResponse.content, sender: 'ai' },
+        ]);
+      } else {
+        setMessages(prevMessages => [
+          ...prevMessages,
+          { id: Date.now().toString(), text: "I'm sorry, I couldn't get a response. Please try again.", sender: 'ai' },
+        ]);
+      }
+
+      if (!selectedChatId) {
+        if (data.conversation_id) {
+          setSelectedChatId(data.conversation_id);
+          const newChatTitle = data.messages.find((msg: ApiMessage) => msg.role === 'user')?.content || 'New Chat';
+          const newChatHistoryItem = { _id: data.conversation_id, title: newChatTitle };
+          setFetchedChatHistory(prevHistory => [newChatHistoryItem, ...prevHistory]);
+        }
+      } else {
+        const updatedChat = fetchedChatHistory.find(chat => chat._id === selectedChatId);
+
+        if (updatedChat) {
+          const otherChats = fetchedChatHistory.filter(chat => chat._id !== selectedChatId);
+          setFetchedChatHistory([updatedChat, ...otherChats]);
+        }
+      }
+
+    } catch (error: unknown) {
+      console.error('Error sending message:', error);
+      let errorMessage = 'An unknown error occurred.';
+
+      if (typeof error === 'object' && error !== null && 'message' in error) {
+        errorMessage = (error as { message: string }).message;
+      }
+      
+      setMessages(prevMessages => [
+        ...prevMessages,
+        { id: Date.now().toString() + 'err', text: `An error occurred: ${errorMessage}`, sender: 'ai' },
+      ]);
+    } finally {
+      setIsSendingMessage(false);
+    }
+  };
+
+  const handleSelectChat = (chatId: string) => {
+    setSelectedChatId(chatId);
+    setIsSidebarOpen(false);
+    fetchChatMessages(chatId);
+  };
+
+  const startNewChat = () => {
+    setMessages([]);
+    setSelectedChatId(null);
+    setIsSidebarOpen(false);
+  };
+
+  const handleTranscription = async (filePath: string) => {
+    if (!filePath) {
+      Toast.show({ type: 'error', text1: 'Audio file not found.' });
+      return;
+    }
+
+    setIsTranscribing(true);
+
+    try {
+      const formData = new FormData();
+      formData.append('file', {
+        uri: `file://${filePath}`,
+        type: 'audio/wav',
+        name: 'recording.wav',
+      });
+
+      const response = await fetch('https://shiksha-gpt.com/api/transcribe', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'multipart/form-data',
+        },
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Transcription API failed: ${response.status} - ${errorText}`);
+      }
+
+      const data = await response.json();
+      
+      if (data && data.text) {
+        setNewMessage(data.text);
+      } else {
+        Toast.show({ type: 'error', text1: 'No text found in transcription response.' });
+      }
+
+    } catch (error) {
+      console.error('Transcription error:', error);
+      Toast.show({ type: 'error', text1: 'Failed to transcribe audio.', text2: `${(error as Error).message}` });
+    } finally {
+      setIsTranscribing(false);
+      try {
+        await RNFS.unlink(filePath);
+      } catch (err) {
+        console.warn('Failed to delete recorded file:', err);
+      }
+      setRecordedFilePath(null);
+    }
+  };
+
+  const handleMicPress = async () => {
+    if (Platform.OS === 'android' && !hasMicPermission) {
+        try {
+            const granted = await PermissionsAndroid.request(
+                PermissionsAndroid.PERMISSIONS.RECORD_AUDIO
+            );
+
+            if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
+                Alert.alert('Permission Denied', 'Microphone permission is required for voice input.');
+                setHasMicPermission(false);
+                return;
+            }
+    
+            setHasMicPermission(true);
+
+        } catch (err) {
+            console.warn('Error requesting microphone permission:', err);
+            setHasMicPermission(false);
+            return;
+        }
+    }
+
+    if (isListening) {
+      setIsRecordingLoading(true); // Start loading state for stopping
+      try {
+        const result = await audioRecorderPlayer.current.stopRecorder();
+        setIsListening(false);
+        setRecordedFilePath(result);
+        handleTranscription(result);
+      } catch (error) {
+        console.error('Error stopping recorder:', error);
+        Toast.show({ type: 'error', text1: 'Failed to stop recording.' });
+      } finally {
+        setIsRecordingLoading(false); // End loading state
+      }
+    } else {
+      setIsRecordingLoading(true); // Start loading state for starting
+      try {
+        const path = Platform.select({
+          ios: 'hello.wav',
+          android: `${RNFS.DocumentDirectoryPath}/recording_${Date.now()}.wav`,
+        });
+
+        const audioSet = Platform.select({
+          ios: {
+            AVFormatID: AVEncodingOption.wav,
+            AVEncoderAudioQualityKeyIOS: AVEncoderAudioQualityIOSType.high,
+          },
+          android: {
+            AudioEncoderAndroid: AudioEncoderAndroidType.AAC,
+            AudioSourceAndroid: AudioSourceAndroidType.MIC,
+          },
+        });
+        
+        const result = await audioRecorderPlayer.current.startRecorder(path, audioSet);
+        setIsListening(true);
+        console.log('Recording started at:', result);
+      } catch (error) {
+        console.error('Error starting recorder:', error);
+        setIsListening(false);
+        Toast.show({ type: 'error', text1: 'Failed to start recording.' });
+      } finally {
+        setIsRecordingLoading(false); // End loading state
+      }
+    }
+  };
+
+  const handleCancelMic = async () => {
+    try {
+      if (isListening) {
+        await audioRecorderPlayer.current.stopRecorder();
+      }
+      setIsListening(false);
+      setNewMessage('');
+    } catch (error) {
+      console.error('Error stopping voice recognition:', error);
+    }
+  };
+
+  const handleCopy = (textToCopy: string, messageId: string) => {
+    Clipboard.setString(textToCopy);
+    setCopiedMessageId(messageId);
+    Toast.show({
+      type: 'success',
+      text1: 'Copied!',
+      position: "top",
+      topOffset: 50,
+    });
+    setTimeout(() => {
+      setCopiedMessageId(null);
+    }, 2000);
+  };
+
+  const handleLongPress = (message: Message, event: any) => {
+    if (!isMenuVisible) {
+      Vibration.vibrate(60);
+
+      const pageX = event.nativeEvent.pageX;
+      const pageY = event.nativeEvent.pageY;
+
+      const menuWidth = 160;
+      const menuHeight = 100;
+
+      const adjustedX = pageX + menuWidth > width ? width - menuWidth - 10 : pageX;
+      const adjustedY = pageY + menuHeight > height ? height - menuHeight - 10 : pageY;
+
+      setMenuPosition({ x: adjustedX, y: adjustedY });
+      setSelectedMessageText(message.text);
+      setIsMenuVisible(true);
+    }
+  };
+
+  const handleContextMenuCopy = () => {
+    if (selectedMessageText) {
+      Clipboard.setString(selectedMessageText);
+      Toast.show({ type: 'success', text1: 'Copied!' });
+      setIsMenuVisible(false);
+    }
+  };
+
+  const handleContextMenuSelectText = () => {
+    setIsSelectTextModalVisible(true);
+    setIsMenuVisible(false);
+  };
+
+  const [refreshing, setRefreshing] = useState(false);
+
+  const onRefresh = useCallback(async () => {
+    try {
+      setRefreshing(true);
+      await fetchChatHistory();
+    } catch (err) {
+      console.error("Error refreshing chat history:", err);
+    } finally {
+      setRefreshing(false);
+    }
+  }, []);
+
+  const markdownStyles = StyleSheet.create({
+    body: {
+      fontSize: 16,
+      color: theme.text,
+      lineHeight: 22,
+    },
+    strong: {
+      fontWeight: 'bold',
+      color: theme.text,
+    },
+    bullet_list: {
+      marginBottom: 0,
+    },
+    list_item: {
+      color: theme.text,
+      lineHeight: 25,
+    },
+    heading1: {
+      fontSize: 20,
+      fontWeight: 'bold',
+      color: theme.text,
+    },
+    heading2: {
+      fontSize: 18,
+      fontWeight: 'bold',
+      color: theme.text,
+    },
+  });
+
+  const isChatSelected = selectedChatId !== null;
+
+  return (
+    <View style={[styles.flex1, { backgroundColor: theme.background }]}>
+      {isSidebarOpen && (
+        <View style={[styles.sidebar, { width: width * 0.75, backgroundColor: theme.background }]}>
+          <View style={styles.sidebarHeader}>
+            <View style={styles.searchInputContainer}>
+              <TextInput
+                style={[styles.searchInput, { color: theme.text, backgroundColor: theme.secondary }]}
+                placeholder="Search"
+                placeholderTextColor={theme.text === '#FFFFFF' ? '#9CA3AF' : '#6B7280'}
+                onChangeText={setSearchQuery}
+                value={searchQuery}
+                selectionColor={theme.primary}
+              />
+              <View style={styles.searchIcon}>
+                <FontAwesomeIcon
+                  icon={faMagnifyingGlass as IconProp}
+                  size={16}
+                  color={theme.text}
+                />
+              </View>
+            </View>
+          </View>
+          <FlatList
+            data={filteredChatHistory}
+            keyExtractor={(chat) => chat._id}
+            renderItem={({ item: chat }) => (
+              <TouchableOpacity
+                style={[
+                  styles.chatHistoryItem,
+                  chat._id === selectedChatId && { backgroundColor: theme.secondary },
+                ]}
+                onPress={() => handleSelectChat(chat._id)}
+              >
+                <Text
+                  style={[
+                    styles.chatHistoryItemText,
+                    { color: theme.text },
+                    chat._id === selectedChatId && { color: theme.text },
+                  ]}
+                  numberOfLines={1}
+                  ellipsizeMode="tail"
+                >
+                  {chat.title}
+                </Text>
+              </TouchableOpacity>
+            )}
+            ListHeaderComponent={
+              <>
+                <TouchableOpacity style={styles.navButton} onPress={startNewChat}>
+                  <FontAwesomeIcon
+                    icon={faPlus as IconProp}
+                    size={20}
+                    color={'#8d92a0ff'}
+                    style={styles.navButtonIcon}
+                  />
+                  <Text style={[styles.navButtonText, { color: theme.text }]}>New Chat</Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity style={styles.navButton}>
+                  <FontAwesomeIcon
+                    icon={faFileLines as IconProp}
+                    size={20}
+                    color={theme.primary}
+                    style={styles.navButtonIcon}
+                  />
+                  <Text style={[styles.navButtonText, { color: theme.text }]}>Summarizer</Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity style={styles.navButton}>
+                  <FontAwesomeIcon
+                    icon={faClipboardQuestion as IconProp}
+                    size={20}
+                    color={'#b034b9ff'}
+                    style={styles.navButtonIcon}
+                  />
+                  <Text style={[styles.navButtonText, { color: theme.text }]}>Quiz Generator</Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity style={styles.navButton}>
+                  <FontAwesomeIcon
+                    icon={faClone as IconProp}
+                    size={20}
+                    color={'#4c40a7ff'}
+                    style={styles.navButtonIcon}
+                  />
+                  <Text style={[styles.navButtonText, { color: theme.text }]}>Flash Card</Text>
+                </TouchableOpacity>
+
+                <View style={styles.chatHistorySection}>
+                  <Text style={[styles.chatHistoryHeader, { color: theme.text }]}>Recent</Text>
+                  {isLoadingHistory && <Text style={[styles.loadingText, { color: theme.text }]}>Loading chat history...</Text>}
+                  {errorFetchingHistory && <Text style={[styles.errorText, { color: theme.text }]}>Error: {errorFetchingHistory}</Text>}
+                </View>
+              </>
+            }
+            ListEmptyComponent={
+              !isLoadingHistory && !errorFetchingHistory
+                ? <Text style={[styles.noHistoryText, { color: theme.text }]}>No conversations found.</Text>
+                : null
+            }
+            showsVerticalScrollIndicator={false}
+            contentContainerStyle={styles.sidebarNav}
+            refreshControl={
+              <RefreshControl
+                refreshing={refreshing}
+                onRefresh={onRefresh}
+                tintColor={theme.primary}
+                colors={[theme.primary]}
+              />
+            }
+          />
+
+          <View style={[styles.sidebarFooter, { borderTopColor: theme.card }]}>
+            <TouchableOpacity
+              onPress={() => {
+                setIsSidebarOpen(false);
+                setCurrentScreen('settings');
+              }}
+              style={styles.profileButton}
+            >
+              <View style={[styles.initialsIcon, { backgroundColor: theme.primary }]}>
+                <Text style={styles.initialsText}>{displayInitials}</Text>
+              </View>
+              <Text style={[styles.profileButtonText, { color: theme.text }]}>{displayName}</Text>
+              <FontAwesomeIcon
+                icon={faChevronDown as IconProp}
+                size={12}
+                color={theme.text}
+                style={styles.dropdownIcon}
+              />
+            </TouchableOpacity>
+          </View>
+        </View>
+      )}
+      {isSidebarOpen && (
+        <TouchableOpacity
+          style={[styles.sidebarOverlay]}
+          onPress={() => setIsSidebarOpen(false)}
+        />
+      )}
+      
+
+      <View style={styles.flex1}>
+        <View style={[styles.chatHeader, { backgroundColor: theme.background }, { borderColor: theme.card }]}>
+          <TouchableOpacity onPress={() => {
+            setIsSidebarOpen(true);
+          }} style={styles.headerButton}>
+            <View style={styles.customHamburgerIcon}>
+              <View style={[styles.hamburgerLine, { backgroundColor: theme.text }, styles.hamburgerLine1]} />
+              <View style={[styles.hamburgerLine, { backgroundColor: theme.text }, styles.hamburgerLine2]} />
+              <View style={[styles.hamburgerLine, { backgroundColor: theme.text }, styles.hamburgerLine3]} />
+            </View>
+          </TouchableOpacity>
+          <Text style={[styles.chatHeaderText, { color: theme.text }]}>{selectedChatTitle}</Text>
+          <TouchableOpacity style={styles.headerButton} onPress={startNewChat}>
+            <Text style={[styles.headerButtonText, { color: theme.text }]}>+</Text>
+          </TouchableOpacity>
+        </View>
+        <KeyboardAvoidingView
+          style={styles.flex1}
+          behavior={Platform.OS === 'ios' ? 'height' : "padding"}
+          keyboardVerticalOffset={Platform.OS === 'android' ? 0 : 0}
+          >
+          
+          <View style={{ flex: 1 }} >
+            {!isChatSelected && messages.length === 0 && !isTranscribing ? (
+              <View style={[styles.centeredContent, { backgroundColor: theme.background }]}>
+                <Image
+                  source={require('../assets/icon.png')}
+                  style={styles.chatLogo}
+                />
+                <Text style={[styles.chatWelcomeText, { color: theme.text }]}>
+                  Hi{userProfile?.name ? `, ${userProfile.name.split(' ')[0]}` : ''}, I'm ShikshaGPT.
+                </Text>
+                <Text style={[styles.chatHelpText, { color: theme.text === '#FFFFFF' ? '#9CA3AF' : '#6B7280' }]}>
+                  How can I help you today?
+                </Text>
+              </View>
+            ) : isLoadingMessages ? (
+              <View style={[styles.centeredContent, { backgroundColor: theme.background }]}>
+                <Text style={[styles.loadingText, { color: theme.text }]}>Loading messages...</Text>
+              </View>
+            ) : errorFetchingMessages ? (
+              <View style={[styles.centeredContent, { backgroundColor: theme.background }]}>
+                <Text style={[styles.errorText, { color: theme.text }]}>Error: {errorFetchingMessages}</Text>
+              </View>
+            ) : (
+              <ScrollView ref={scrollViewRef} style={[styles.messagesContainer, { backgroundColor: theme.background }]} showsVerticalScrollIndicator={false} contentContainerStyle={{ flexGrow: 1 }} >  
+                {messages.map((message, index) => (
+                  <TouchableOpacity
+                    key={message.id}
+                    onLongPress={(event) => handleLongPress(message, event)}
+                    style={message.sender === 'user' ? styles.userMessageContainer : styles.aiMessageContainer}
+                  >
+                    {message.sender === 'ai' && (
+                      <View style={styles.aiAvatarHeader}>
+                        <View style={styles.avatarContainer}>
+                          <Image source={require('../assets/icon.png')} style={styles.aiLogo} />
+                        </View>
+                      </View>
+                    )}
+                    <View style={[
+                      message.sender === 'user' ? styles.userMessageBubble : styles.aiMessageBubble,
+                      { backgroundColor: message.sender === 'ai' ? theme.background : theme.secondary, borderTopLeftRadius: message.sender === 'ai' ? 0 : 16, borderTopRightRadius: message.sender === 'user' ? 16 : 4, borderBottomRightRadius: message.sender === 'user' ? 4 : 16, borderBottomLeftRadius: message.sender === 'ai' ? 16 : 16 }
+                    ]}>
+                      <Markdown style={markdownStyles}>
+                        {message.text}
+                      </Markdown>
+                    </View>
+                    {message.sender === 'ai' && index === messages.length - 1 && (
+                      <TouchableOpacity onPress={() => handleCopy(message.text, message.id)} style={styles.copyButton}>
+                        <FontAwesomeIcon icon={copiedMessageId === message.id ? faCheck as IconProp : faCopy as IconProp} size={16} color={theme.secondarytext} />
+                      </TouchableOpacity>
+                    )}
+                  </TouchableOpacity>
+                ))}
+                {isSendingMessage && (
+                  <View style={styles.aiMessageContainer}>
+                    <View style={styles.aiAvatarHeader}>
+                      <View style={styles.avatarContainer}>
+                        <Image source={require('../assets/icon.png')} style={styles.aiLogo} />
+                      </View>
+                    </View>
+                    <View style={[styles.aiMessageBubble, { backgroundColor: theme.background }]}>
+                      <ActivityIndicator size="small" color={theme.text} />
+                    </View>
+                  </View>
+                )}
+              </ScrollView>
+            )}
+          </View>
+          
+
+          <View style={[styles.bottomContainer, { backgroundColor: theme.card }]}>
+            <View style={[styles.messageInputWrapper, { backgroundColor: theme.card }]}>
+              <TextInput
+                style={[styles.messageTextInput, { color: theme.text }]}
+                placeholder="Ask ShikshaGPT"
+                placeholderTextColor={theme.text === '#FFFFFF' ? '#9CA3AF' : '#6B7280'}
+                value={newMessage}
+                onChangeText={setNewMessage}
+                multiline={true}
+                numberOfLines={6}
+                editable={!isSendingMessage && !isTranscribing}
+                selectionColor={theme.primary}
+              />
+            </View>
+            
+            <View style={styles.bottomActions}>
+              <View style={styles.iconActionButtons}>
+                <TouchableOpacity style={[styles.plusButton, { backgroundColor: theme.secondaryaction }]}>
+                  <Text style={[styles.plusButtonText, { color: theme.secondarytext }]}>+</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={handleDeepResearchToggle}
+                  style={[styles.deepThinkButton, { backgroundColor: isDeepResearchActive ? theme.primary : theme.secondary }]}
+                >
+                  <Text style={[styles.actionButtonText, { color: isDeepResearchActive ? '#FFFFFF' : theme.text }]}>
+                    Deep Research
+                  </Text>
+                </TouchableOpacity>
+              </View>
+              <View style={styles.iconActionButtons}>
+                <TouchableOpacity
+                  onPress={handleMicPress}
+                  disabled={isSendingMessage || isTranscribing || isRecordingLoading}
+                  style={[
+                    styles.micButton,
+                    { backgroundColor: isListening ? theme.primary : theme.secondaryaction },
+                  ]}
+                >
+                  {isRecordingLoading ? (
+                    <ActivityIndicator size="small" color={isListening ? '#FFF' : theme.secondarytext} />
+                  ) : (
+                    <FontAwesomeIcon
+                      icon={isListening ? faStop as IconProp : faMicrophone as IconProp}
+                      size={20}
+                      color={isListening ? '#FFF' : theme.secondarytext}
+                    />
+                  )}
+                </TouchableOpacity>
+                {isListening && (
+                  <TouchableOpacity
+                    onPress={handleCancelMic}
+                    disabled={isSendingMessage || isTranscribing}
+                    style={[
+                      styles.micButton,
+                      { backgroundColor: theme.secondaryaction, marginLeft: 5 },
+                    ]}
+                  >
+                    <Text style={[styles.plusButtonText, { color: theme.secondarytext, fontSize: 18 }]}>Cancel</Text>
+                  </TouchableOpacity>
+                )}
+                <TouchableOpacity
+                  onPress={handleSendMessage}
+                  disabled={!newMessage.trim() || isSendingMessage || isListening || isTranscribing}
+                  style={[
+                    styles.sendButton,
+                    newMessage.trim() && !isSendingMessage ? { backgroundColor: theme.primary } : { backgroundColor: `${theme.primary}60` },
+                    isListening && { backgroundColor: `${theme.primary}60` },
+                  ]}
+                >
+                  <FontAwesomeIcon
+                    icon={faArrowUp as IconProp}
+                    size={20}
+                    color="#F3F4F6"
+                  />
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        </KeyboardAvoidingView>
+      </View>
+
+      {isMenuVisible && (
+        <TouchableOpacity style={styles.overlay} onPress={() => setIsMenuVisible(false)} />
+      )}
+      <ContextMenu
+        isVisible={isMenuVisible}
+        position={menuPosition}
+        onCopy={handleContextMenuCopy}
+        onSelectText={handleContextMenuSelectText}
+        onClose={() => setIsMenuVisible(false)}
+        theme={theme}
+      />
+      
+      <SelectTextModal
+        isVisible={isSelectTextModalVisible}
+        text={selectedMessageText}
+        onClose={() => setIsSelectTextModalVisible(false)}
+        theme={theme}
+      />
+
+      <Toast />
+    </View>
+  );
+};
+
+const styles = StyleSheet.create({
+  flex1: {
+    flex: 1,
+  },
+  chatHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingVertical: 6,
+  },
+  headerButton: {
+    padding: 8,
+    borderRadius: 9999,
+  },
+  headerButtonText: {
+    fontSize: 20,
+  },
+  chatHeaderText: {
+    fontWeight: '400',
+    paddingHorizontal: 10,
+  },
+  customHamburgerIcon: {
+    width: 24,
+    height: 18,
+    justifyContent: 'space-between',
+  },
+  hamburgerLine: {
+    height: 1.5,
+    borderRadius: 1,
+  },
+  hamburgerLine1: {
+    width: 24,
+  },
+  hamburgerLine2: {
+    width: 18,
+  },
+  hamburgerLine3: {
+    width: 12,
+  },
+  centeredContent: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 16,
+  },
+  messagesContainer: {
+    flex: 1,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    flexDirection: 'column',
+  },
+  chatLogo: {
+    width: 90,
+    height: 90,
+    marginBottom: 12,
+  },
+  aiLogo: {
+    width: 40,
+    height: 40,
+    marginBottom: 1,
+  },
+  chatWelcomeText: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    marginBottom: 8,
+  },
+  chatHelpText: {
+    fontSize: 15,
+  },
+  userMessageContainer: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    marginBottom: 16,
+  },
+  aiMessageContainer: {
+    alignItems: 'flex-start',
+    marginBottom: 16,
+  },
+  userMessageBubble: {
+    paddingHorizontal: 12,
+    paddingVertical: 4,
+    borderRadius: 16,
+    maxWidth: '80%',
+  },
+  aiMessageBubble: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 16,
+    width: '100%',
+    flexGrow: 0,
+  },
+  avatarContainer: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginHorizontal: 8,
+  },
+  aiAvatarHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  aiAvatar: {
+    fontSize: 20,
+  },
+  copyButton: {
+    left: 0,
+    padding: 8,
+  },
+  bottomContainer: {
+    flexDirection: 'column',
+    paddingHorizontal: 15,
+    paddingBottom: 15,
+    paddingTop: 15,
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+  },
+  messageInputWrapper: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 2,
+    paddingVertical: 8,
+    borderRadius: 9999,
+    width: '100%',
+    marginBottom: 12,
+  },
+  messageTextInput: {
+    flex: 1,
+    paddingVertical: 0,
+    paddingHorizontal: 0,
+    backgroundColor: 'transparent',
+    textAlignVertical: 'top',
+  },
+  bottomActions: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  iconActionButtons: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  actionButton: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 9999,
+    marginLeft: 4,
+    marginRight: 4,
+  },
+  actionButtonText: {
+    fontSize: 14,
+    fontWeight: '400',
+  },
+  plusButton: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 5,
+  },
+  plusButtonText: {
+    fontSize: 25,
+    fontWeight: 'normal',
+    lineHeight: 22,
+  },
+  deepThinkButton: {
+    padding: 7,
+    borderRadius: 9999,
+  },
+  micButton: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 5,
+  },
+  sendButton: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  sidebar: {
+    position: 'absolute',
+    left: 0,
+    top: 0,
+    bottom: 0,
+    zIndex: 50,
+    flexDirection: 'column',
+  },
+  sidebarHeader: {
+    padding: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  searchInputContainer: {
+    flex: 1,
+    marginRight: 8,
+    position: 'relative',
+  },
+  searchInput: {
+    width: '100%',
+    paddingLeft: 40,
+    borderRadius: 9999,
+  },
+  searchIcon: {
+    position: 'absolute',
+    left: 12,
+    top: '50%',
+    marginTop: -8,
+  },
+  sidebarNav: {
+    paddingBottom: 10,
+  },
+  navButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 8,
+    marginBottom: 4,
+  },
+  navButtonIcon: {
+    marginRight: 8,
+  },
+  navButtonText: {
+    lineHeight: 18,
+    fontSize: 17,
+    fontWeight: '500',
+  },
+  chatHistorySection: {
+    marginBottom: 8,
+    marginTop: 8,
+  },
+  chatHistoryHeader: {
+    fontSize: 11,
+    fontWeight: '400',
+    textTransform: 'uppercase',
+    marginBottom: 4,
+    lineHeight: 14,
+    paddingHorizontal: 10,
+  },
+  chatHistoryItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+  },
+  chatHistoryItemText: {
+    fontSize: 18,
+    lineHeight: 30,
+    flexShrink: 1,
+  },
+  sidebarFooter: {
+    padding: 16,
+    marginBottom: 15,
+    borderTopWidth: 0.5,
+  },
+  profileButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderRadius: 8,
+  },
+  initialsIcon: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 12,
+  },
+  initialsText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+  profileButtonText: {
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  dropdownIcon: {
+    marginLeft: 8,
+  },
+  sidebarOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(47, 47, 47, 0.6)',
+    zIndex: 40,
+  },
+  loadingText: {
+    textAlign: 'center',
+  },
+  errorText: {
+    textAlign: 'center',
+    paddingVertical: 10,
+    color: '#FF4500',
+  },
+  noHistoryText: {
+    textAlign: 'center',
+    paddingVertical: 10,
+  },
+  contextMenu: {
+    position: 'absolute',
+    backgroundColor: 'white',
+    borderRadius: 8,
+    padding: 5,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 3.84,
+    elevation: 5,
+    zIndex: 100,
+  },
+  contextMenuItem: {
+    paddingHorizontal: 15,
+    paddingVertical: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  contextMenuText: {
+    fontSize: 16,
+    color: '#333',
+  },
+  contextMenuIcon: {
+    marginRight: 10,
+  },
+  overlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'transparent',
+    zIndex: 99,
+  },
+  modalContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0, 0, 0, 0.6)',
+  },
+  modalContent: {
+    width: '90%',
+    maxHeight: '80%',
+    borderRadius: 16,
+    padding: 20,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 4,
+    elevation: 5,
+  },
+  modalCloseButton: {
+    position: 'absolute',
+    top: 15,
+    right: 15,
+    zIndex: 1,
+  },
+  modalTitle: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    marginBottom: 15,
+    textAlign: 'center',
+  },
+  textSelectionScrollView: {
+    marginBottom: 20,
+  },
+  selectableText: {
+    fontSize: 16,
+    lineHeight: 24,
+  },
+});
+
+export default ChatScreen;
